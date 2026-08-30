@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use reqwest::Client;
 use serde::Deserialize;
 use std::fs::{self, File as StdFile};
+// use std::io;
 use std::io::{BufReader as StdBufReader};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tokio::fs::{create_dir_all, File as TokioFile};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader };
 use sha1::{Sha1, Digest};
 use hex;
+// use zip::ZipArchive;
 
 // Структуры version_manifest_v2.json
 #[derive(Deserialize)]
@@ -35,6 +38,33 @@ struct MinecraftManifest {
     libraries: Vec<LibraryInfo>,
     assetIndex: AssetIndex,
     logging: LoggingInfo,
+
+    mainClass: String,
+    javaVersion: JavaVersionInfo,
+    arguments: ArgumentsIndex,
+}
+
+#[derive(Deserialize)]
+struct ArgumentsIndex {
+    game: Vec<Argument>,
+    jvm: Vec<Argument>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ArgumentValue {
+    String(String),
+    List(Vec<String>),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Argument {
+    String(String),
+    Conditional {
+        rules: Option<Vec<Rules>>,
+        value: ArgumentValue,
+    }
 }
 
 // Структуры assets
@@ -78,17 +108,22 @@ struct VersionInfo { id: String, url: String } // Структура инфор�
 #[derive(Deserialize)]
 struct VersionDownload { client: DownloadInfo, server: DownloadInfo }
 #[derive(Deserialize)]
-struct LibraryInfo { downloads: LibraryArtifact, name: String, rules: Option<Vec<LibraryRule>> }
+struct LibraryInfo { downloads: LibraryArtifact, name: String, rules: Option<Vec<Rules>> }
 #[derive(Deserialize)]
-struct LibraryRule { action: String, os: Option<OsRule> }
+struct Rules { action: String, os: Option<OsRule> }
 #[derive(Deserialize)]
-struct OsRule { name: String }
+struct OsRule {
+    name: Option<String>,
+    arch: Option<String>,
+}
 #[derive(Deserialize)]
 struct LibraryArtifact { artifact: DownloadLibraryInfo }
 #[derive(Deserialize)]
 struct LoggingInfo { client: LoggingClient }
 #[derive(Deserialize)]
 struct LoggingClient { argument: String, file: DownloadLoggingInfo, r#type: String }
+#[derive(Deserialize)]
+struct JavaVersionInfo { component: String, majorVersion: u8 }
 
 
 // Основная функция скрипта
@@ -107,7 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let minecraft_manifest = read_version_json(&path)?;
 
-        download_minecraft(&http_client, minecraft_manifest, &base_dir).await?;
+        download_minecraft(&http_client, &minecraft_manifest, &base_dir).await?;
+
+        build_minecraft(&minecraft_manifest, &base_dir).await?;
 
     } else { println!("Failed to determine the path to system folders.") }
 
@@ -213,7 +250,7 @@ fn read_version_json(
 // Главная функция установки
 async fn download_minecraft(
     http_client: &Client,
-    minecraft_manifest: MinecraftManifest,
+    minecraft_manifest: &MinecraftManifest,
     base_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
 
@@ -303,6 +340,55 @@ async fn calculate_file_sha1(path: &Path) -> Result<String, Box<dyn std::error::
 }
 
 
+// Распаковщик
+// fn unzipping_natives(
+//     file_path: &Path,
+//     out_dir: &Path,
+// ) -> Result<(), Box<dyn std::error::Error>> {
+//     let file = fs::File::open(file_path)?;
+//     let mut archive = ZipArchive::new(file)?;
+//
+//     for i in 0..archive.len() {
+//         let mut file = archive.by_index(i)?;
+//
+//         let out_path = match file.enclosed_name() {
+//             Some(path) => out_dir.join(path),
+//             None => continue,
+//         };
+//
+//         if file.is_dir() || out_path.starts_with("META-INF") {
+//             continue;
+//         }
+//
+//         let is_native = out_path
+//             .extension()
+//             .and_then(|ext| ext.to_str())
+//             .map_or(false, |ext| matches!(ext, "dll" | "so" | "dylib" | "jnilib" ));
+//
+//         if is_native {
+//             let final_path = out_dir.join(&out_path);
+//
+//             if let Some(parent_dir) = final_path.parent() {
+//                 if !parent_dir.exists() {
+//                     fs::create_dir_all(parent_dir)?;
+//                 }
+//             }
+//
+//             if final_path.exists() {
+//                 println!("{} already exists", file.name());
+//             } else {
+//                 let mut out_file = fs::File::create(&final_path)?;
+//                 io::copy(&mut file, &mut out_file)?;
+//
+//                 println!("Unzipping {} to {}", file.name(), out_path.display());
+//             }
+//         }
+//     }
+//
+//     Ok(())
+// }
+
+
 // Устанавливаем Client.jar
 async fn install_client(
     http_client: &Client,
@@ -332,30 +418,62 @@ async fn install_libraries(
     let mut os_name = std::env::consts::OS;
     if os_name == "macos" { os_name = "osx"; }
 
+    let arch = std::env::consts::ARCH;
+
     for lib in minecraft_manifest.libraries.iter() {
-        let mut is_compatible_os = lib.rules.is_none();
+        let is_compatible = is_compatible(lib.rules.as_deref(), &os_name, &arch);
 
-        if !is_compatible_os {
-            for rule in lib.rules.iter().flatten() {
-                if rule.os.is_none() { is_compatible_os = rule.action == "allow"; }
-                else if let Some(os_rule) = &rule.os {
-                    if os_rule.name == os_name {
-                        is_compatible_os = rule.action == "allow";
-                    }
-                }
-            }
-        }
+        if !is_compatible { continue}
 
-        if is_compatible_os {
-            let library_info = &lib.downloads.artifact;
-            let library_path = libraries_dir.join(&library_info.path);
+        let library_info = &lib.downloads.artifact;
+        let library_path = libraries_dir.join(&library_info.path);
 
-            download_file(&http_client, &library_path, &library_info.info).await?;
-        }
+        download_file(&http_client, &library_path, &library_info.info).await?;
     }
 
     Ok(())
 }
+
+
+// Проверка совместимости
+fn is_compatible(
+    rules: Option<&[Rules]>,
+    os: &str,
+    arch: &str,
+) -> bool {
+    let Some(rules) = rules else {
+        return true;
+    };
+
+    if rules.is_empty() { return true }
+
+    let mut is_compatible = false;
+
+    for rule in rules {
+        let os_matches = match &rule.os {
+            None => true,
+
+            Some(os_rule) => {
+                let name_matches = os_rule
+                    .name
+                    .as_deref()
+                    .map_or(true, |name| name == os);
+
+                let arch_matches = os_rule
+                    .arch
+                    .as_deref()
+                    .map_or(true, |rule_arch| rule_arch == arch);
+
+                name_matches && arch_matches
+            }
+        };
+
+        if os_matches { is_compatible = rule.action == "allow"; }
+    }
+
+    is_compatible
+}
+
 
 // Устанавливаем ассеты
 async fn install_assets(
@@ -439,3 +557,170 @@ async fn install_log_config(
     Ok(())
 }
 
+
+
+// Собираем конфигурацию запуска Minecraft
+async fn build_minecraft(
+    minecraft_manifest: &MinecraftManifest,
+    base_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let launcher_name = "AsymptoteLauncher";
+    let launcher_version = "0.0.5";
+
+    println!("Building Minecraft manifest...");
+
+    let classpath = form_classpath(&minecraft_manifest, &base_dir)?;
+    let natives_directory = prepare_natives_directory(&minecraft_manifest, &base_dir).await?;
+    let jvm_arguments = form_jvm_arguments(&minecraft_manifest, &base_dir, &launcher_name, &launcher_version, &classpath, &natives_directory);
+
+    Ok(())
+}
+
+
+// Формируем classpath
+fn form_classpath(
+    minecraft_manifest: &MinecraftManifest,
+    base_dir: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let separator = if cfg!(windows) { ";" } else { ":" };
+
+    let mut libraries_paths: Vec<String> = Vec::new();
+
+    let version_jar_path = base_dir
+        .join("versions")
+        .join(&minecraft_manifest.id)
+        .join(format!("{}.jar", &minecraft_manifest.id))
+        .to_string_lossy()
+        .into_owned();
+
+    let mut os_name = std::env::consts::OS;
+    if os_name == "macos" { os_name = "osx"; }
+
+    let arch = std::env::consts::ARCH;
+
+    for lib in minecraft_manifest.libraries.iter() {
+        let is_compatible = is_compatible(lib.rules.as_deref(), &os_name, &arch);
+
+        if !is_compatible { continue; }
+
+        let lib_path = base_dir
+            .join("libraries")
+            .join(&lib.downloads.artifact.path);
+        libraries_paths.push(lib_path.to_string_lossy().into_owned());
+    }
+
+    libraries_paths.push(version_jar_path);
+
+    let classpath = libraries_paths.join(separator);
+
+    println!("Classpath successfully created");
+
+    Ok(classpath)
+}
+
+
+// Создание и подготовка директории Natives
+async fn prepare_natives_directory(
+    minecraft_manifest: &MinecraftManifest,
+    base_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let natives_dir = base_dir
+        .join("versions")
+        .join(&minecraft_manifest.id)
+        .join("natives");
+
+    create_dir_all(&natives_dir.join("java")).await?;
+    create_dir_all(&natives_dir.join("jna")).await?;
+    create_dir_all(&natives_dir.join("lwjgl")).await?;
+    create_dir_all(&natives_dir.join("netty")).await?;
+
+    println!("Natives directory successfully created");
+
+    Ok(natives_dir)
+}
+
+
+// Формируем jvm аргументы
+fn form_jvm_arguments(
+    minecraft_manifest: &MinecraftManifest,
+    base_dir: &Path,
+    launcher_name: &str,
+    launcher_version: &str,
+    classpath: &str,
+    natives_directory: &Path,
+) -> Vec<String> {
+    let mut jvm_arguments: Vec<String> = Vec::new();
+
+    let arguments = &minecraft_manifest.arguments;
+
+    let mut os_name = std::env::consts::OS;
+    if os_name == "macos" { os_name = "osx"; }
+
+    let arch = std::env::consts::ARCH;
+
+    for argument in arguments.jvm.iter() {
+        match argument {
+            Argument::String(result) => {
+                let processed = result
+                    .replace("${launcher_name}", &launcher_name)
+                    .replace("${launcher_version}", &launcher_version)
+                    .replace("${classpath}", &classpath)
+                    .replace("${natives_directory}", &natives_directory.to_string_lossy());
+                jvm_arguments.push(processed);
+            }
+
+            Argument::Conditional { rules, value } => {
+                let is_compatible = is_compatible(rules.as_deref(), &os_name, &arch);
+
+                if !is_compatible { continue; }
+
+
+                match value {
+                    ArgumentValue::String(result) => {
+                        let processed = result
+                            .replace("${launcher_name}", &launcher_name)
+                            .replace("${launcher_version}", &launcher_version)
+                            .replace("${classpath}", &classpath)
+                            .replace("${natives_directory}", &natives_directory.to_string_lossy());
+                        jvm_arguments.push(processed);
+                    }
+
+                    ArgumentValue::List(result) => {
+                        for result in result {
+                            let processed = result
+                                .replace("${launcher_name}", &launcher_name)
+                                .replace("${launcher_version}", &launcher_version)
+                                .replace("${classpath}", &classpath)
+                                .replace("${natives_directory}", &natives_directory.to_string_lossy());
+                            jvm_arguments.push(processed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    jvm_arguments.push(get_logging_argument(&minecraft_manifest, &base_dir));
+
+    println!("JVM arguments successfully created");
+
+    jvm_arguments
+}
+
+fn get_logging_argument (
+    minecraft_manifest: &MinecraftManifest,
+    base_dir: &Path,
+) -> String {
+    let log_config_path = base_dir
+        .join("assets")
+        .join("log-configs")
+        .join(&minecraft_manifest.logging.client.file.id);
+
+    let logging_argument = minecraft_manifest
+        .logging
+        .client
+        .argument
+        .replace("${path}", &log_config_path.to_string_lossy());
+
+    logging_argument
+}
