@@ -1,0 +1,1 @@
+C:\Users\vadim\RustroverProjects\asymptote-launcher\target\debug\mojang-api.exe: C:\Users\vadim\RustroverProjects\asymptote-launcher\src\core_prototype\core.rs C:\Users\vadim\RustroverProjects\asymptote-launcher\src\core_prototype\mod.rs C:\Users\vadim\RustroverProjects\asymptote-launcher\src\main.rs
