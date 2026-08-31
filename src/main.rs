@@ -828,12 +828,6 @@ async fn build_minecraft(
     let default_user_jvm_arguments = form_default_user_jvm_arguments(&minecraft_manifest);
     let game_arguments = form_game_arguments(&minecraft_manifest, &game_info, &launch_features);
 
-    println!("JAVA: {}", java_path);
-    println!("MAIN CLASS: {}", minecraft_manifest.mainClass);
-    println!("DEFAULT JVM: {:?}", default_user_jvm_arguments);
-    println!("JVM ARG COUNT: {}", jvm_arguments.len());
-    println!("GAME ARGS: {:?}", game_arguments);
-
     let mut launch_command = Command::new(java_path);
 
     launch_command
