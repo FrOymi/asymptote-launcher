@@ -13,6 +13,9 @@ use sha1::{Sha1, Digest};
 use hex;
 // use zip::ZipArchive;
 
+
+
+// LAUNCH CONTEXT
 struct CompatibilityContext<'a> {
     os: &'a str,
     arch: &'a str,
@@ -20,134 +23,6 @@ struct CompatibilityContext<'a> {
     features: &'a LaunchFeatures,
 }
 
-// Структуры version_manifest_v2.json
-#[derive(Deserialize)]
-struct VersionManifest {
-    latest: ManifestLatest,
-    versions: Vec<ManifestVersion>,
-}
-
-#[derive(Deserialize)]
-struct ManifestLatest {
-    release: String,
-}
-
-#[derive(Deserialize)]
-struct ManifestVersion {
-    id: String,
-    url: String,
-}
-
-// Структуры <version>.json
-#[derive(Deserialize)]
-struct MinecraftManifest {
-    id: String,
-    downloads: VersionDownload,
-    libraries: Vec<LibraryInfo>,
-    assetIndex: AssetIndex,
-    logging: LoggingInfo,
-
-    mainClass: String,
-    javaVersion: JavaVersionInfo,
-    arguments: ArgumentsIndex,
-    r#type: String,
-}
-
-#[derive(Deserialize)]
-struct ArgumentsIndex {
-    game: Vec<Argument>,
-    jvm: Vec<Argument>,
-
-    #[serde(rename= "default-user-jvm")]
-    default_user_jvm: Vec<Argument>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum ArgumentValue {
-    String(String),
-    List(Vec<String>),
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Argument {
-    String(String),
-    Conditional {
-        rules: Option<Vec<Rules>>,
-        value: ArgumentValue,
-    }
-}
-
-// Структуры assets
-#[derive(Deserialize)]
-struct AssetIndex {
-    id: String,
-    sha1: String,
-    size: u64,
-    totalSize: u64,
-    url: String,
-}
-#[derive(Deserialize)]
-struct Assets { objects: HashMap<String, AssetObject> }
-#[derive(Deserialize)]
-struct AssetObject { hash: String, size: u64 }
-
-
-//Вспомогательные структуры
-
-#[derive(Deserialize)]
-struct DownloadInfo {
-    sha1: String,
-    size: u64,
-    url: String
-}
-#[derive(Deserialize)]
-struct DownloadLibraryInfo {
-    path: String,
-    #[serde(flatten)]
-    info: DownloadInfo,
-}
-
-#[derive(Deserialize)]
-struct DownloadLoggingInfo {
-    id: String,
-    #[serde(flatten)]
-    info: DownloadInfo,
-}
-
-struct VersionInfo { id: String, url: String } // Структура информации о версии для передачи между функциями
-#[derive(Deserialize)]
-struct VersionDownload { client: DownloadInfo, server: DownloadInfo }
-#[derive(Deserialize)]
-struct LibraryInfo { downloads: LibraryArtifact, name: String, rules: Option<Vec<Rules>> }
-#[derive(Deserialize)]
-struct Rules {
-    action: String,
-    os: Option<OsRule>,
-    features: Option<Features>,
-}
-#[derive(Deserialize)]
-struct OsRule {
-    name: Option<String>,
-    arch: Option<String>,
-    versionRange: Option<VersionRange>,
-}
-#[derive(Deserialize)]
-struct VersionRange {
-    min: Option<String>,
-    max: Option<String>,
-}
-#[derive(Deserialize)]
-struct Features {
-    is_demo_user: Option<bool>,
-    has_custom_resolution: Option<bool>,
-    has_quick_plays_support: Option<bool>,
-    is_quick_play_singleplayer: Option<bool>,
-    is_quick_play_multiplayer: Option<bool>,
-    is_quick_play_realms: Option<bool>,
-
-}
 #[derive(Default)]
 struct LaunchFeatures {
     is_demo_user: bool,
@@ -157,6 +32,7 @@ struct LaunchFeatures {
     is_quick_play_multiplayer: bool,
     is_quick_play_realms: bool,
 }
+
 struct GameInfo<'a> {
     player_name: &'a str,
     version_name: &'a str,
@@ -175,14 +51,204 @@ struct GameInfo<'a> {
     quick_play_multiplayer: &'a str,
     quick_play_realms: &'a str,
 }
+
+
+// VERSION MANIFEST
+// version_manifest_v2.json
 #[derive(Deserialize)]
-struct LibraryArtifact { artifact: DownloadLibraryInfo }
+struct VersionManifest {
+    latest: ManifestLatest,
+    versions: Vec<ManifestVersion>,
+}
+
 #[derive(Deserialize)]
-struct LoggingInfo { client: LoggingClient }
+struct ManifestLatest {
+    release: String,
+}
+
 #[derive(Deserialize)]
-struct LoggingClient { argument: String, file: DownloadLoggingInfo, r#type: String }
+struct ManifestVersion {
+    id: String,
+    url: String,
+}
+
+struct VersionInfo { // Структура информации о версии для передачи между функциями
+    id: String,
+    url: String
+}
+
+
+// MINECRAFT VERSION MANIFEST
+// <version>.json
 #[derive(Deserialize)]
-struct JavaVersionInfo { component: String, majorVersion: u8 }
+#[serde(rename_all = "camelCase")]
+struct MinecraftManifest {
+    id: String,
+    r#type: String,
+
+    downloads: VersionDownload,
+    libraries: Vec<LibraryInfo>,
+    asset_index: AssetIndex,
+    logging: LoggingInfo,
+
+    main_class: String,
+    java_version: JavaVersionInfo,
+    arguments: ArgumentsIndex,
+}
+
+
+// ARGUMENTS
+#[derive(Deserialize)]
+struct ArgumentsIndex {
+    game: Vec<Argument>,
+    jvm: Vec<Argument>,
+
+    #[serde(rename= "default-user-jvm")]
+    default_user_jvm: Vec<Argument>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Argument {
+    String(String),
+    Conditional {
+        rules: Option<Vec<Rules>>,
+        value: ArgumentValue,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ArgumentValue {
+    String(String),
+    List(Vec<String>),
+}
+
+
+// RULES
+#[derive(Deserialize)]
+struct Rules {
+    action: String,
+    os: Option<OsRule>,
+    features: Option<Features>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OsRule {
+    name: Option<String>,
+    arch: Option<String>,
+    version_range: Option<VersionRange>,
+}
+
+#[derive(Deserialize)]
+struct VersionRange {
+    min: Option<String>,
+    max: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Features {
+    is_demo_user: Option<bool>,
+    has_custom_resolution: Option<bool>,
+    has_quick_plays_support: Option<bool>,
+    is_quick_play_singleplayer: Option<bool>,
+    is_quick_play_multiplayer: Option<bool>,
+    is_quick_play_realms: Option<bool>,
+
+}
+
+
+// DOWNLOADS
+#[derive(Deserialize)]
+struct DownloadInfo {
+    sha1: String,
+    size: u64,
+    url: String
+}
+
+#[derive(Deserialize)]
+struct VersionDownload {
+    client: DownloadInfo,
+    server: DownloadInfo
+}
+
+#[derive(Deserialize)]
+struct DownloadLibraryInfo {
+    path: String,
+
+    #[serde(flatten)]
+    info: DownloadInfo,
+}
+
+#[derive(Deserialize)]
+struct DownloadLoggingInfo {
+    id: String,
+    #[serde(flatten)]
+    info: DownloadInfo,
+}
+
+
+// LIBRARIES
+#[derive(Deserialize)]
+struct LibraryInfo {
+    downloads: LibraryArtifact,
+    name: String,
+    rules: Option<Vec<Rules>>
+}
+
+#[derive(Deserialize)]
+struct LibraryArtifact {
+    artifact: DownloadLibraryInfo,
+}
+
+
+// ASSETS
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssetIndex {
+    id: String,
+    sha1: String,
+    size: u64,
+    total_size: u64,
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct Assets {
+    objects: HashMap<String, AssetObject>
+}
+
+#[derive(Deserialize)]
+struct AssetObject {
+    hash: String,
+    size: u64
+}
+
+
+// LOGGING
+#[derive(Deserialize)]
+struct LoggingInfo {
+    client: LoggingClient
+}
+
+#[derive(Deserialize)]
+struct LoggingClient {
+    argument: String,
+    file: DownloadLoggingInfo,
+    r#type: String
+}
+
+
+// JAVA
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JavaVersionInfo {
+    component: String,
+    major_version: u8
+}
+
+
 
 
 // Основная функция скрипта
@@ -551,7 +617,7 @@ fn check_os_rule(
         .as_deref()
         .map_or(true, |rule_arch| rule_arch == context.arch);
 
-    let version_matches = match &os_rule.versionRange {
+    let version_matches = match &os_rule.version_range {
         None => true,
 
         Some(range) => {
@@ -703,7 +769,7 @@ async fn install_assets(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resources_download_url = "https://resources.download.minecraft.net";
 
-    let asset_json_path = download_assets_json(&http_client, &minecraft_manifest.assetIndex, &base_dir).await?;
+    let asset_json_path = download_assets_json(&http_client, &minecraft_manifest.asset_index, &base_dir).await?;
     let assets = read_assets_json(&asset_json_path)?;
 
     let object_path = base_dir.join("assets").join("objects");
@@ -796,7 +862,7 @@ async fn build_minecraft(
         &minecraft_manifest.id,
         &game_directory,
         &assets_root,
-        &minecraft_manifest.assetIndex.id,
+        &minecraft_manifest.asset_index.id,
         "00000000-0000-0000-0000-000000000000",
         "null",
         "",
@@ -832,7 +898,7 @@ async fn build_minecraft(
     launch_command
         .args(&default_user_jvm_arguments)
         .args(&jvm_arguments)
-        .arg(&minecraft_manifest.mainClass)
+        .arg(&minecraft_manifest.main_class)
         .args(&game_arguments)
         .current_dir(game_directory);
 
