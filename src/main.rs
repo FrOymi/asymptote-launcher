@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use reqwest::Client;
 use serde::Deserialize;
@@ -11,6 +12,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader };
 use sha1::{Sha1, Digest};
 use hex;
 // use zip::ZipArchive;
+
+struct CompatibilityContext<'a> {
+    os: &'a str,
+    arch: &'a str,
+    os_version: Option<&'a str>,
+    features: &'a LaunchFeatures,
+}
 
 // Структуры version_manifest_v2.json
 #[derive(Deserialize)]
@@ -42,12 +50,16 @@ struct MinecraftManifest {
     mainClass: String,
     javaVersion: JavaVersionInfo,
     arguments: ArgumentsIndex,
+    r#type: String,
 }
 
 #[derive(Deserialize)]
 struct ArgumentsIndex {
     game: Vec<Argument>,
     jvm: Vec<Argument>,
+
+    #[serde(rename= "default-user-jvm")]
+    default_user_jvm: Vec<Argument>,
 }
 
 #[derive(Deserialize)]
@@ -110,11 +122,58 @@ struct VersionDownload { client: DownloadInfo, server: DownloadInfo }
 #[derive(Deserialize)]
 struct LibraryInfo { downloads: LibraryArtifact, name: String, rules: Option<Vec<Rules>> }
 #[derive(Deserialize)]
-struct Rules { action: String, os: Option<OsRule> }
+struct Rules {
+    action: String,
+    os: Option<OsRule>,
+    features: Option<Features>,
+}
 #[derive(Deserialize)]
 struct OsRule {
     name: Option<String>,
     arch: Option<String>,
+    versionRange: Option<VersionRange>,
+}
+#[derive(Deserialize)]
+struct VersionRange {
+    min: Option<String>,
+    max: Option<String>,
+}
+#[derive(Deserialize)]
+struct Features {
+    is_demo_user: Option<bool>,
+    has_custom_resolution: Option<bool>,
+    has_quick_plays_support: Option<bool>,
+    is_quick_play_singleplayer: Option<bool>,
+    is_quick_play_multiplayer: Option<bool>,
+    is_quick_play_realms: Option<bool>,
+
+}
+#[derive(Default)]
+struct LaunchFeatures {
+    is_demo_user: bool,
+    has_custom_resolution: bool,
+    has_quick_plays_support: bool,
+    is_quick_play_singleplayer: bool,
+    is_quick_play_multiplayer: bool,
+    is_quick_play_realms: bool,
+}
+struct GameInfo<'a> {
+    player_name: &'a str,
+    version_name: &'a str,
+    game_directory: &'a str,
+    assets_root: &'a str,
+    assets_index_name: &'a str,
+    uuid: &'a str,
+    access_token: &'a str,
+    client_id: &'a str,
+    xuid: &'a str,
+    version_type: &'a str,
+    resolution_width: &'a str,
+    resolution_height: &'a str,
+    quick_play_path: &'a str,
+    quick_play_singleplayer: &'a str,
+    quick_play_multiplayer: &'a str,
+    quick_play_realms: &'a str,
 }
 #[derive(Deserialize)]
 struct LibraryArtifact { artifact: DownloadLibraryInfo }
@@ -144,12 +203,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         download_minecraft(&http_client, &minecraft_manifest, &base_dir).await?;
 
-        build_minecraft(&minecraft_manifest, &base_dir).await?;
+        let launch_command = build_minecraft(&minecraft_manifest, &base_dir).await?;
+
+        launch_minecraft(launch_command)?;
 
     } else { println!("Failed to determine the path to system folders.") }
 
     Ok(())
 }
+
+// Функция запуска Minecraft
+fn launch_minecraft(
+    mut launch_command: Command
+) -> Result <(), Box<dyn std::error::Error>> {
+    let _child = launch_command.spawn()?;
+
+    println!("Launching Minecraft Game");
+
+    Ok(())
+}
+
 
 // Получаем путь к директории .minecraft и создаем папку для сохранения Манифеста версий
 fn get_minecraft_dir() -> Option<PathBuf> {
@@ -415,13 +488,13 @@ async fn install_libraries(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let libraries_dir = base_dir.join("libraries");
 
-    let mut os_name = std::env::consts::OS;
-    if os_name == "macos" { os_name = "osx"; }
+    let features = LaunchFeatures::default();
+    let os_version = get_os_version();
 
-    let arch = std::env::consts::ARCH;
+    let context = create_compatibility_context(&features, os_version.as_deref());
 
     for lib in minecraft_manifest.libraries.iter() {
-        let is_compatible = is_compatible(lib.rules.as_deref(), &os_name, &arch);
+        let is_compatible = is_compatible(lib.rules.as_deref(), &context);
 
         if !is_compatible { continue}
 
@@ -438,8 +511,7 @@ async fn install_libraries(
 // Проверка совместимости
 fn is_compatible(
     rules: Option<&[Rules]>,
-    os: &str,
-    arch: &str,
+    context: &CompatibilityContext,
 ) -> bool {
     let Some(rules) = rules else {
         return true;
@@ -450,30 +522,179 @@ fn is_compatible(
     let mut is_compatible = false;
 
     for rule in rules {
-        let os_matches = match &rule.os {
-            None => true,
+        let os_matches = check_os_rule(rule.os.as_ref(), context);
 
-            Some(os_rule) => {
-                let name_matches = os_rule
-                    .name
-                    .as_deref()
-                    .map_or(true, |name| name == os);
+        let feature_matches = check_feature_rule(rule.features.as_ref(), context.features);
 
-                let arch_matches = os_rule
-                    .arch
-                    .as_deref()
-                    .map_or(true, |rule_arch| rule_arch == arch);
+        let rule_matches = os_matches && feature_matches;
 
-                name_matches && arch_matches
-            }
-        };
-
-        if os_matches { is_compatible = rule.action == "allow"; }
+        if rule_matches { is_compatible = rule.action == "allow"; }
     }
 
     is_compatible
 }
 
+fn check_os_rule(
+    os_rule: Option<&OsRule>,
+    context: &CompatibilityContext,
+) -> bool {
+    let Some(os_rule) = os_rule else {
+        return true;
+    };
+
+    let name_matches = os_rule
+        .name
+        .as_deref()
+        .map_or(true, |name| name == context.os);
+
+    let arch_matches = os_rule
+        .arch
+        .as_deref()
+        .map_or(true, |rule_arch| rule_arch == context.arch);
+
+    let version_matches = match &os_rule.versionRange {
+        None => true,
+
+        Some(range) => {
+            check_version_range(context.os_version, range)
+        }
+    };
+
+    name_matches && arch_matches && version_matches
+}
+
+fn check_feature_rule(
+    rule: Option<&Features>,
+    actual: &LaunchFeatures,
+) -> bool {
+    let Some(rule) = rule else { return true };
+
+    if let Some(required) = rule.is_demo_user {
+        if actual.is_demo_user != required { return false; }
+    }
+    if let Some(required) = rule.has_custom_resolution {
+        if actual.has_custom_resolution != required { return false; }
+    }
+    if let Some(required) = rule.has_quick_plays_support {
+        if actual.has_quick_plays_support != required { return false; }
+    }
+    if let Some(required) = rule.is_quick_play_singleplayer {
+        if actual.is_quick_play_singleplayer != required { return false; }
+    }
+    if let Some(required) = rule.is_quick_play_multiplayer {
+        if actual.is_quick_play_multiplayer != required { return false; }
+    }
+    if let Some(required) = rule.is_quick_play_realms {
+        if actual.is_quick_play_realms != required { return false; }
+    }
+    true
+}
+
+fn parse_version(version: &str) -> Option<Vec<u32>> {
+    version
+        .split('.')
+        .map(|part| part.parse::<u32>().ok())
+        .collect()
+}
+
+fn compare_versions(
+    left: &str,
+    right: &str,
+) -> Option<Ordering> {
+    let left = parse_version(left)?;
+    let right = parse_version(right)?;
+
+    let max_len = left.len().max(right.len());
+
+    for i in 0..max_len {
+        let left_part = *left.get(i).unwrap_or(&0);
+        let right_part = *right.get(i).unwrap_or(&0);
+
+        match left_part.cmp(&right_part) {
+            Ordering::Equal => continue,
+            result => return Some(result),
+        }
+    }
+
+    Some(Ordering::Equal)
+}
+
+fn check_version_range(
+    current_version: Option<&str>,
+    range: &VersionRange,
+) -> bool {
+    if range.min.is_none() && range.max.is_none() {
+        return true;
+    }
+
+    let Some(current_version) = current_version else {
+        return false;
+    };
+
+    if let Some(min) = range.min.as_deref() {
+        match compare_versions(current_version, min) {
+            Some(Ordering::Less) | None => return false,
+            _ => {}
+        }
+    }
+    if let Some(max) = range.max.as_deref() {
+        match compare_versions(current_version, max) {
+            Some(Ordering::Less) => {},
+            Some(_) | None => return false,
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn get_os_version() -> Option<String> {
+    let output = Command::new("cmd")
+        .args(["/C", "ver"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    let start = text.find('[')?;
+    let end = text[start + 1..].find(']')? + start + 1;
+
+    let inside = &text[start + 1..end];
+
+    inside
+        .split_whitespace()
+        .find(|part| {
+            part.chars()
+                .next()
+                .map_or(false, |c| c.is_ascii_digit())
+        })
+        .map(|version| version.to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_os_version() -> Option<String> {
+    None
+}
+
+fn create_compatibility_context<'a>(
+    features: &'a LaunchFeatures,
+    os_version: Option<&'a str>,
+) -> CompatibilityContext<'a> {
+    let os = match std::env::consts::OS {
+        "macos" => "osx",
+        other => other,
+    };
+
+    CompatibilityContext {
+        os,
+        arch: std::env::consts::ARCH,
+        os_version,
+        features,
+    }
+}
 
 // Устанавливаем ассеты
 async fn install_assets(
@@ -563,17 +784,104 @@ async fn install_log_config(
 async fn build_minecraft(
     minecraft_manifest: &MinecraftManifest,
     base_dir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Command, Box<dyn std::error::Error>> {
+    let game_directory = base_dir.to_string_lossy().into_owned();
+    let assets_root = base_dir.join("assets").to_string_lossy().into_owned();
+    let java_path = r"C:\Program Files\Eclipse Adoptium\jdk-25.0.4.101-hotspot\bin\java.exe";
+
     let launcher_name = "AsymptoteLauncher";
     let launcher_version = "0.0.5";
+
+    let game_info = get_game_info(
+        "Fr0ymi",
+        &minecraft_manifest.id,
+        &game_directory,
+        &assets_root,
+        &minecraft_manifest.assetIndex.id,
+        "00000000-0000-0000-0000-000000000000",
+        "null",
+        "",
+        "",
+        &minecraft_manifest.r#type,
+        "854",
+        "480",
+        "",
+        "",
+        "",
+        "",
+    );
+
+    let launch_features = LaunchFeatures {
+        is_demo_user: false,
+        has_custom_resolution: true,
+        has_quick_plays_support: false,
+        is_quick_play_singleplayer: false,
+        is_quick_play_multiplayer: false,
+        is_quick_play_realms: false,
+    };
 
     println!("Building Minecraft manifest...");
 
     let classpath = form_classpath(&minecraft_manifest, &base_dir)?;
     let natives_directory = prepare_natives_directory(&minecraft_manifest, &base_dir).await?;
     let jvm_arguments = form_jvm_arguments(&minecraft_manifest, &base_dir, &launcher_name, &launcher_version, &classpath, &natives_directory);
+    let default_user_jvm_arguments = form_default_user_jvm_arguments(&minecraft_manifest);
+    let game_arguments = form_game_arguments(&minecraft_manifest, &game_info, &launch_features);
 
-    Ok(())
+    println!("JAVA: {}", java_path);
+    println!("MAIN CLASS: {}", minecraft_manifest.mainClass);
+    println!("DEFAULT JVM: {:?}", default_user_jvm_arguments);
+    println!("JVM ARG COUNT: {}", jvm_arguments.len());
+    println!("GAME ARGS: {:?}", game_arguments);
+
+    let mut launch_command = Command::new(java_path);
+
+    launch_command
+        .args(&default_user_jvm_arguments)
+        .args(&jvm_arguments)
+        .arg(&minecraft_manifest.mainClass)
+        .args(&game_arguments)
+        .current_dir(game_directory);
+
+    Ok(launch_command)
+}
+
+fn get_game_info<'a>(
+    player_name: &'a str,
+    version_name: &'a str,
+    game_directory: &'a str,
+    assets_root: &'a str,
+    assets_index_name: &'a str,
+    uuid: &'a str,
+    access_token: &'a str,
+    client_id: &'a str,
+    xuid: &'a str,
+    version_type: &'a str,
+    resolution_width: &'a str,
+    resolution_height: &'a str,
+    quick_play_path: &'a str,
+    quick_play_singleplayer: &'a str,
+    quick_play_multiplayer: &'a str,
+    quick_play_realms: &'a str,
+) -> GameInfo<'a> {
+    GameInfo {
+        player_name,
+        version_name,
+        game_directory,
+        assets_root,
+        assets_index_name,
+        uuid,
+        access_token,
+        client_id,
+        xuid,
+        version_type,
+        resolution_width,
+        resolution_height,
+        quick_play_path,
+        quick_play_singleplayer,
+        quick_play_multiplayer,
+        quick_play_realms,
+    }
 }
 
 
@@ -593,13 +901,13 @@ fn form_classpath(
         .to_string_lossy()
         .into_owned();
 
-    let mut os_name = std::env::consts::OS;
-    if os_name == "macos" { os_name = "osx"; }
+    let features = LaunchFeatures::default();
+    let os_version = get_os_version();
 
-    let arch = std::env::consts::ARCH;
+    let context = create_compatibility_context(&features, os_version.as_deref());
 
     for lib in minecraft_manifest.libraries.iter() {
-        let is_compatible = is_compatible(lib.rules.as_deref(), &os_name, &arch);
+        let is_compatible = is_compatible(lib.rules.as_deref(), &context);
 
         if !is_compatible { continue; }
 
@@ -653,10 +961,10 @@ fn form_jvm_arguments(
 
     let arguments = &minecraft_manifest.arguments;
 
-    let mut os_name = std::env::consts::OS;
-    if os_name == "macos" { os_name = "osx"; }
+    let features = LaunchFeatures::default();
+    let os_version = get_os_version();
 
-    let arch = std::env::consts::ARCH;
+    let context = create_compatibility_context(&features, os_version.as_deref());
 
     for argument in arguments.jvm.iter() {
         match argument {
@@ -670,7 +978,7 @@ fn form_jvm_arguments(
             }
 
             Argument::Conditional { rules, value } => {
-                let is_compatible = is_compatible(rules.as_deref(), &os_name, &arch);
+                let is_compatible = is_compatible(rules.as_deref(), &context);
 
                 if !is_compatible { continue; }
 
@@ -707,6 +1015,8 @@ fn form_jvm_arguments(
     jvm_arguments
 }
 
+
+// Получить logging аргумент
 fn get_logging_argument (
     minecraft_manifest: &MinecraftManifest,
     base_dir: &Path,
@@ -724,3 +1034,112 @@ fn get_logging_argument (
 
     logging_argument
 }
+
+
+// Формируем default_user_jvm аргументы
+fn form_default_user_jvm_arguments(
+    minecraft_manifest: &MinecraftManifest,
+) -> Vec<String> {
+    let mut default_user_jvm_arguments: Vec<String> = Vec::new();
+
+    let arguments = &minecraft_manifest.arguments;
+
+    let features = LaunchFeatures::default();
+    let os_version = get_os_version();
+
+    let context = create_compatibility_context(&features, os_version.as_deref());
+
+    for argument in arguments.default_user_jvm.iter() {
+        match argument {
+            Argument::String(result) => {
+                default_user_jvm_arguments.push(result.clone());
+            }
+            Argument::Conditional { rules, value } => {
+                let is_compatible = is_compatible(rules.as_deref(), &context);
+                if !is_compatible { continue; }
+
+                match value {
+                    ArgumentValue::String(result) => {
+                        default_user_jvm_arguments.push(result.clone());
+                    }
+                    ArgumentValue::List(result) => {
+                        for result in result {
+                            default_user_jvm_arguments.push(result.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("Default user jvm arguments successfully created");
+
+    default_user_jvm_arguments
+}
+
+fn reform_game_argument (argument: &str, game_info: &GameInfo) -> String {
+    argument
+        .replace("${auth_player_name}", game_info.player_name)
+        .replace("${version_name}", game_info.version_name)
+        .replace("${game_directory}", game_info.game_directory)
+        .replace("${assets_root}", game_info.assets_root)
+        .replace("${assets_index_name}", game_info.assets_index_name)
+        .replace("${auth_uuid}", game_info.uuid)
+        .replace("${auth_access_token}", game_info.access_token)
+        .replace("${clientid}", game_info.client_id)
+        .replace("${auth_xuid}", game_info.xuid)
+        .replace("${version_type}", game_info.version_type)
+        .replace("${resolution_width}", game_info.resolution_width)
+        .replace("${resolution_height}", game_info.resolution_height)
+        .replace("${quickPlayPath}", game_info.quick_play_path)
+        .replace("${quickPlaySingleplayer}", game_info.quick_play_singleplayer)
+        .replace("${quickPlayMultiplayer}", game_info.quick_play_multiplayer)
+        .replace("${quickPlayRealms}", game_info.quick_play_realms)
+}
+
+
+// Формируем game аргументы
+fn form_game_arguments(
+    minecraft_manifest: &MinecraftManifest,
+    game_info: &GameInfo,
+    features: &LaunchFeatures
+) -> Vec<String> {
+    let mut game_arguments: Vec<String> = Vec::new();
+
+    let arguments = &minecraft_manifest.arguments;
+
+    let os_version = get_os_version();
+    let context = create_compatibility_context(features, os_version.as_deref());
+
+    for argument in arguments.game.iter() {
+        match argument {
+            Argument::String(result) => {
+                let processed = reform_game_argument(result, game_info);
+                game_arguments.push(processed);
+            }
+
+            Argument::Conditional { rules, value } => {
+                let is_compatible = is_compatible(rules.as_deref(), &context);
+                if !is_compatible { continue; }
+
+                match value {
+                    ArgumentValue::String(result) => {
+                        let processed = reform_game_argument(result, game_info);
+                        game_arguments.push(processed);
+                    }
+                    ArgumentValue::List(result) => {
+                        for result in result {
+                            let processed = reform_game_argument(result, game_info);
+                            game_arguments.push(processed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("Game arguments successfully created");
+
+    game_arguments
+}
+
