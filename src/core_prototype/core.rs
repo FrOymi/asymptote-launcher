@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tokio::fs::{create_dir_all, File as TokioFile};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader };
+use futures::stream::{self, StreamExt, TryStreamExt};
 use sha1::{Sha1, Digest};
 use hex;
 // use zip::ZipArchive;
@@ -103,7 +104,7 @@ struct ArgumentsIndex {
     game: Vec<Argument>,
     jvm: Vec<Argument>,
 
-    #[serde(rename= "default-user-jvm")]
+    #[serde(default, rename= "default-user-jvm")]
     default_user_jvm: Vec<Argument>,
 }
 
@@ -339,6 +340,11 @@ fn find_latest_release(
 
     println!("latest version: {}", latest_release);
 
+    // Some(VersionInfo {
+    //     id: "1.18.2".to_string(),
+    //     url: "https://piston-meta.mojang.com/v1/packages/334b33fcba3c9be4b7514624c965256535bd7eba/1.18.2.json".to_string(),
+    // })
+
     Some(VersionInfo {
         id: latest_release.clone(),
         url: target_version.url.clone(),
@@ -558,16 +564,34 @@ async fn install_libraries(
 
     let context = create_compatibility_context(&features, os_version.as_deref());
 
-    for lib in minecraft_manifest.libraries.iter() {
-        let is_compatible = is_compatible(lib.rules.as_deref(), &context);
+    stream::iter(minecraft_manifest.libraries.iter())
+        .filter_map(|lib| async  {
+            let is_compatible = is_compatible(lib.rules.as_deref(), &context);
 
-        if !is_compatible { continue}
+            if !is_compatible { return None; }
 
-        let library_info = &lib.downloads.artifact;
-        let library_path = libraries_dir.join(&library_info.path);
+            let library_info = &lib.downloads.artifact;
+            let library_path = libraries_dir.join(&library_info.path);
 
-        download_file(&http_client, &library_path, &library_info.info).await?;
-    }
+            Some((library_info, library_path))
+        })
+        .map(|(library_info, library_path)| {
+            async move { download_file(&http_client, &library_path, &library_info.info).await }
+        })
+        .buffer_unordered(16)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    // for lib in minecraft_manifest.libraries.iter() {
+    //     let is_compatible = is_compatible(lib.rules.as_deref(), &context);
+    //
+    //     if !is_compatible { continue}
+    //
+    //     let library_info = &lib.downloads.artifact;
+    //     let library_path = libraries_dir.join(&library_info.path);
+    //
+    //     download_file(&http_client, &library_path, &library_info.info).await?;
+    // }
 
     Ok(())
 }
@@ -775,21 +799,45 @@ async fn install_assets(
     let object_path = base_dir.join("assets").join("objects");
     create_dir_all(&object_path).await?;
 
-    for asset in assets.objects.iter() {
-        let asset_info = &asset.1;
+    stream::iter(assets.objects.iter())
+        .map(|asset| {
+            let asset_info = asset.1;
 
-        let resource_dir_name = &asset_info.hash[..2];
-        let resource_path = object_path.join(format!("{}", resource_dir_name)).join(&asset_info.hash);
-        let resource_download_url = format!("{}/{}/{}", resources_download_url, resource_dir_name, &asset_info.hash);
+            let resource_dir_name = &asset_info.hash[..2];
+            let resource_path = object_path.join(resource_dir_name).join(&asset_info.hash);
+            let resource_download_url = format!("{}/{}/{}", resources_download_url, resource_dir_name, &asset_info.hash);
 
-        let resource_download_info: DownloadInfo = DownloadInfo {
-            sha1: asset_info.hash.clone(),
-            size: asset_info.size,
-            url: resource_download_url,
-        };
+            let resource_download_info: DownloadInfo = DownloadInfo {
+                sha1: asset_info.hash.clone(),
+                size: asset_info.size,
+                url: resource_download_url,
 
-        download_file(&http_client, &resource_path, &resource_download_info).await?;
-    }
+            };
+
+            (resource_path, resource_download_info)
+        })
+        .map(|(resource_path, resource_download_info)| {
+            async move { download_file(&http_client, &resource_path, &resource_download_info).await }
+        })
+        .buffer_unordered(16)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    // for asset in assets.objects.iter() {
+    //     let asset_info = &asset.1;
+    //
+    //     let resource_dir_name = &asset_info.hash[..2];
+    //     let resource_path = object_path.join(format!("{}", resource_dir_name)).join(&asset_info.hash);
+    //     let resource_download_url = format!("{}/{}/{}", resources_download_url, resource_dir_name, &asset_info.hash);
+    //
+    //     let resource_download_info: DownloadInfo = DownloadInfo {
+    //         sha1: asset_info.hash.clone(),
+    //         size: asset_info.size,
+    //         url: resource_download_url,
+    //     };
+    //
+    //     download_file(&http_client, &resource_path, &resource_download_info).await?;
+    // }
 
     Ok(())
 }
